@@ -10,8 +10,6 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessageChunk
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
-
-# SQLite checkpointer for LangGraph
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 
@@ -101,7 +99,7 @@ def add_message(conversation_id: str, role: str, content: str) -> None:
         INSERT INTO messages (conversation_id, role, content, created_at)
         VALUES (?, ?, ?, ?)
         """,
-        (conversation_id, role, content, now),
+        (conversation_id, role, str(content).strip(), now),
     )
 
     cur.execute(
@@ -177,12 +175,22 @@ def has_message(conversation_id: str, role: str, content: str) -> bool:
         WHERE conversation_id = ? AND role = ? AND content = ?
         LIMIT 1
         """,
-        (conversation_id, role, content),
+        (conversation_id, role, str(content).strip()),
     )
     row = cur.fetchone()
     conn.close()
     return row is not None
 
+
+def delete_conversation(conversation_id: str) -> None:
+    conn = get_chat_conn()
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+    cur.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+    conn.commit()
+    conn.close()
 
 # =========================================================
 # LLM
@@ -241,7 +249,7 @@ Return only the final email text.
 """
 
     response = llm.invoke(user_message)
-    return {"draft": response.content}
+    return {"draft": str(response.content).strip()}
 
 
 def reviewer(state: EmailState):
@@ -277,6 +285,7 @@ def sender(state: EmailState):
 # =========================================================
 # BUILD GRAPH
 # =========================================================
+@st.cache_resource
 def build_workflow():
     checkpoint_conn = sqlite3.connect(CHECKPOINT_DB, check_same_thread=False)
     checkpointer = SqliteSaver(checkpoint_conn)
@@ -327,7 +336,22 @@ def get_interrupt_payload_from_snapshot(snapshot):
     return None
 
 
-def stream_graph_until_interrupt(workflow, input_data, thread_id: str, placeholder):
+def render_messages(messages):
+    for msg in messages:
+        role = msg["role"]
+        content = str(msg["content"]).strip()
+
+        if role == "user":
+            with st.chat_message("user"):
+                st.markdown(content)
+        elif role == "assistant":
+            with st.chat_message("assistant"):
+                st.markdown(content)
+        else:
+            st.info(content)
+
+
+def stream_graph_until_interrupt(workflow, input_data, thread_id: str):
     """
     Stream LangGraph execution with stream_mode='messages'.
 
@@ -342,46 +366,52 @@ def stream_graph_until_interrupt(workflow, input_data, thread_id: str, placehold
     interrupt_payload = None
     final_state = {}
 
-    for msg, meta in workflow.stream(
-        input_data,
-        config=get_config(thread_id),
-        stream_mode="messages",
-    ):
-        if (
-            isinstance(msg, AIMessageChunk)
-            and msg.content
-            and meta.get("langgraph_node") == "drafter"
+    with st.chat_message("assistant"):
+        stream_placeholder = st.empty()
+
+        for msg, meta in workflow.stream(
+            input_data,
+            config=get_config(thread_id),
+            stream_mode="messages",
         ):
-            if isinstance(msg.content, str):
-                chunk_text = msg.content
-            elif isinstance(msg.content, list):
-                chunk_text = "".join(
-                    part.get("text", "")
-                    for part in msg.content
-                    if isinstance(part, dict)
-                )
-            else:
-                chunk_text = str(msg.content)
+            if (
+                isinstance(msg, AIMessageChunk)
+                and msg.content
+                and meta.get("langgraph_node") == "drafter"
+            ):
+                if isinstance(msg.content, str):
+                    chunk_text = msg.content
+                elif isinstance(msg.content, list):
+                    chunk_text = "".join(
+                        part.get("text", "")
+                        for part in msg.content
+                        if isinstance(part, dict)
+                    )
+                else:
+                    chunk_text = str(msg.content)
 
-            streamed_text += chunk_text
-            placeholder.markdown(streamed_text)
+                streamed_text += chunk_text
+                stream_placeholder.markdown(streamed_text + "▌")
 
-    snapshot = get_graph_state(workflow, thread_id)
+        snapshot = get_graph_state(workflow, thread_id)
 
-    if snapshot and snapshot.values:
-        final_state = dict(snapshot.values)
+        if snapshot and snapshot.values:
+            final_state = dict(snapshot.values)
 
-    interrupt_payload = get_interrupt_payload_from_snapshot(snapshot)
+        interrupt_payload = get_interrupt_payload_from_snapshot(snapshot)
+        final_draft = str(final_state.get("draft", streamed_text) or streamed_text).strip()
+
+        stream_placeholder.markdown(final_draft)
 
     return {
-        "draft_text": final_state.get("draft", streamed_text) or streamed_text,
+        "draft_text": final_draft,
         "interrupt_payload": interrupt_payload,
         "final_state": final_state,
     }
 
 
 # =========================================================
-# STREAMLIT UI
+# PAGE CONFIG + CSS
 # =========================================================
 st.set_page_config(
     page_title="Email Drafting Agent",
@@ -389,6 +419,45 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+    }
+
+    [data-testid="stSidebar"] {
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .review-panel {
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: 1rem;
+        background: rgba(255,255,255,0.02);
+        min-height: 620px;
+    }
+
+    .conversation-wrap {
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: 0.5rem;
+        background: rgba(255,255,255,0.02);
+    }
+
+    .stChatMessage {
+        margin-bottom: 0.65rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# INIT
+# =========================================================
 init_chat_db()
 workflow = build_workflow()
 
@@ -398,6 +467,10 @@ if "current_conversation_id" not in st.session_state:
 st.title("📧 Human-in-the-Loop Email Drafting Agent")
 st.caption("Draft → Review → Revise/Approve → Send")
 
+
+# =========================================================
+# SIDEBAR
+# =========================================================
 with st.sidebar:
     st.subheader("Conversations")
 
@@ -409,17 +482,29 @@ with st.sidebar:
 
     if conversations:
         for conv in conversations:
-            label = f"{conv['title']}  [{conv['status']}]"
-            if st.button(label, key=conv["id"], use_container_width=True):
-                st.session_state.current_conversation_id = conv["id"]
-                st.rerun()
+            row1, row2 = st.columns([4, 1])
+
+            with row1:
+                label = f"{conv['title']}  [{conv['status']}]"
+                if st.button(label, key=f"open_{conv['id']}", use_container_width=True):
+                    st.session_state.current_conversation_id = conv["id"]
+                    st.rerun()
+
+            with row2:
+                if st.button("🗑️", key=f"delete_{conv['id']}", use_container_width=True):
+                    delete_conversation(conv["id"])
+
+                    if st.session_state.current_conversation_id == conv["id"]:
+                        st.session_state.current_conversation_id = None
+
+                    st.rerun()
     else:
         st.info("No conversations yet.")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # NEW CONVERSATION
-# ---------------------------------------------------------
+# =========================================================
 if st.session_state.current_conversation_id is None:
     st.subheader("Start a new email workflow")
 
@@ -440,15 +525,24 @@ if st.session_state.current_conversation_id is None:
             add_message(conversation_id, "user", prompt.strip())
 
             try:
-                st.subheader("Streaming Draft")
-                stream_box = st.empty()
+                left, right = st.columns([2.2, 1], gap="large")
 
-                stream_result = stream_graph_until_interrupt(
-                    workflow=workflow,
-                    input_data={"prompt": prompt.strip()},
-                    thread_id=conversation_id,
-                    placeholder=stream_box,
-                )
+                with left:
+                    st.subheader("Conversation")
+                    with st.container(height=620, border=False):
+                        with st.chat_message("user"):
+                            st.markdown(prompt.strip())
+
+                        stream_result = stream_graph_until_interrupt(
+                            workflow=workflow,
+                            input_data={"prompt": prompt.strip()},
+                            thread_id=conversation_id,
+                        )
+
+                with right:
+                    st.subheader("Review Panel")
+                    with st.container(border=True):
+                        st.info("Generating draft...")
 
                 draft = stream_result["draft_text"]
                 payload = stream_result["interrupt_payload"]
@@ -469,126 +563,118 @@ if st.session_state.current_conversation_id is None:
                 st.error(f"Failed to generate draft: {e}")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # EXISTING CONVERSATION
-# ---------------------------------------------------------
+# =========================================================
 else:
     conversation_id = st.session_state.current_conversation_id
     messages = get_messages(conversation_id)
 
-    left, right = st.columns([2, 1])
+    left, right = st.columns([2.2, 1], gap="large")
 
     with left:
         st.subheader("Conversation")
-
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-
-            if role == "user":
-                with st.chat_message("user"):
-                    st.markdown(content)
-            elif role == "assistant":
-                with st.chat_message("assistant"):
-                    st.markdown(content)
-            else:
-                st.info(content)
+        with st.container(height=620, border=True):
+            render_messages(messages)
 
     with right:
         st.subheader("Review Panel")
 
         snapshot = get_graph_state(workflow, conversation_id)
-        current_draft = get_current_draft_from_state(workflow, conversation_id)
-
         awaiting_review = bool(snapshot and snapshot.next and "reviewer" in snapshot.next)
         completed = bool(snapshot and snapshot.values and snapshot.values.get("approved") is True)
 
-        if current_draft:
-            st.markdown("**Latest Draft**")
-            st.text_area(
-                "Draft",
-                value=current_draft,
-                height=320,
-                disabled=True,
-                label_visibility="collapsed",
-            )
+        with st.container(border=True):
+            if completed:
+                st.success("Email Sent!")
+                if not has_message(conversation_id, "system", "Email Sent!"):
+                    add_message(conversation_id, "system", "Email Sent!")
+                    update_conversation_status(conversation_id, "completed")
+                    st.rerun()
 
-        if completed:
-            st.success("Email Sent!")
-            if not has_message(conversation_id, "system", "Email Sent!"):
-                add_message(conversation_id, "system", "Email Sent!")
-                update_conversation_status(conversation_id, "completed")
-                st.rerun()
+            elif awaiting_review:
+                current_draft = get_current_draft_from_state(workflow, conversation_id)
+                if current_draft:
+                    st.markdown("**Current Draft**")
+                    st.text_area(
+                        "Current Draft",
+                        value=current_draft,
+                        height=260,
+                        disabled=True,
+                        label_visibility="collapsed",
+                    )
 
-        elif awaiting_review:
-            revise_feedback = st.text_area(
-                "Revision feedback",
-                placeholder="Make it more apologetic.",
-                height=120,
-            )
+                revise_feedback = st.text_area(
+                    "Revision feedback",
+                    placeholder="Make it more apologetic.",
+                    height=120,
+                )
 
-            col1, col2 = st.columns(2)
+                col1, col2 = st.columns(2)
 
-            with col1:
-                if st.button("✅ Approve & Send", use_container_width=True):
-                    try:
-                        workflow.invoke(
-                            Command(resume={"action": "approve"}),
-                            config=get_config(conversation_id),
-                        )
-
-                        if not has_message(conversation_id, "system", "Email Sent!"):
-                            add_message(conversation_id, "system", "Email Sent!")
-
-                        update_conversation_status(conversation_id, "completed")
-                        st.rerun()
-
-                    except Exception as e:
-                        add_message(conversation_id, "system", f"Error: {e}")
-                        update_conversation_status(conversation_id, "error")
-                        st.error(f"Failed to approve/send: {e}")
-
-            with col2:
-                if st.button("✏️ Revise", use_container_width=True):
-                    if not revise_feedback.strip():
-                        st.warning("Enter feedback before revising.")
-                    else:
+                with col1:
+                    if st.button("✅ Approve & Send", use_container_width=True):
                         try:
-                            revision_message = f"Revision request: {revise_feedback.strip()}"
-                            if not has_message(conversation_id, "user", revision_message):
-                                add_message(conversation_id, "user", revision_message)
-
-                            st.markdown("**Streaming Revised Draft**")
-                            stream_box = st.empty()
-
-                            stream_result = stream_graph_until_interrupt(
-                                workflow=workflow,
-                                input_data=Command(
-                                    resume={
-                                        "action": "revise",
-                                        "feedback": revise_feedback.strip(),
-                                    }
-                                ),
-                                thread_id=conversation_id,
-                                placeholder=stream_box,
+                            workflow.invoke(
+                                Command(resume={"action": "approve"}),
+                                config=get_config(conversation_id),
                             )
 
-                            new_draft = stream_result["draft_text"]
-                            payload = stream_result["interrupt_payload"]
+                            if not has_message(conversation_id, "system", "Email Sent!"):
+                                add_message(conversation_id, "system", "Email Sent!")
 
-                            if new_draft and not has_message(conversation_id, "assistant", new_draft):
-                                add_message(conversation_id, "assistant", new_draft)
-
-                            if payload:
-                                update_conversation_status(conversation_id, "awaiting_review")
-                            else:
-                                update_conversation_status(conversation_id, "completed")
-
+                            update_conversation_status(conversation_id, "completed")
                             st.rerun()
 
                         except Exception as e:
                             add_message(conversation_id, "system", f"Error: {e}")
                             update_conversation_status(conversation_id, "error")
-                            st.error(f"Failed to revise draft: {e}")
-        else:
-            st.info("This conversation is not currently waiting for review.")
+                            st.error(f"Failed to approve/send: {e}")
+
+                with col2:
+                    if st.button("✏️ Revise", use_container_width=True):
+                        if not revise_feedback.strip():
+                            st.warning("Enter feedback before revising.")
+                        else:
+                            try:
+                                revision_message = f"Revision request: {revise_feedback.strip()}"
+                                if not has_message(conversation_id, "user", revision_message):
+                                    add_message(conversation_id, "user", revision_message)
+
+                                with left:
+                                    st.subheader("Conversation")
+                                    refreshed_messages = get_messages(conversation_id)
+
+                                    with st.container(height=620, border=True):
+                                        render_messages(refreshed_messages)
+
+                                        stream_result = stream_graph_until_interrupt(
+                                            workflow=workflow,
+                                            input_data=Command(
+                                                resume={
+                                                    "action": "revise",
+                                                    "feedback": revise_feedback.strip(),
+                                                }
+                                            ),
+                                            thread_id=conversation_id,
+                                        )
+
+                                new_draft = stream_result["draft_text"]
+                                payload = stream_result["interrupt_payload"]
+
+                                if new_draft and not has_message(conversation_id, "assistant", new_draft):
+                                    add_message(conversation_id, "assistant", new_draft)
+
+                                if payload:
+                                    update_conversation_status(conversation_id, "awaiting_review")
+                                else:
+                                    update_conversation_status(conversation_id, "completed")
+
+                                st.rerun()
+
+                            except Exception as e:
+                                add_message(conversation_id, "system", f"Error: {e}")
+                                update_conversation_status(conversation_id, "error")
+                                st.error(f"Failed to revise draft: {e}")
+            else:
+                st.info("This conversation is not currently waiting for review.")
