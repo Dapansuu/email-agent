@@ -1,8 +1,9 @@
 import os
 import sqlite3
 import uuid
+import hashlib
 from datetime import datetime
-from typing import TypedDict
+from typing import TypedDict, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -28,6 +29,13 @@ CHECKPOINT_DB = "email_checkpoints.db"
 
 
 # =========================================================
+# SECURITY HELPERS
+# =========================================================
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+# =========================================================
 # DATABASE HELPERS
 # =========================================================
 def get_chat_conn() -> sqlite3.Connection:
@@ -42,12 +50,25 @@ def init_chat_db() -> None:
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
             title TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'drafting',
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
         """
     )
@@ -65,11 +86,93 @@ def init_chat_db() -> None:
         """
     )
 
+    # Migration safety: add user_id if old DB exists without it
+    cur.execute("PRAGMA table_info(conversations)")
+    cols = [row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cur.fetchall()]
+    if "user_id" not in cols:
+        cur.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT")
+
     conn.commit()
     conn.close()
 
 
-def create_conversation(title: str) -> str:
+# =========================================================
+# USER HELPERS
+# =========================================================
+def register_user(username: str, password: str) -> tuple[bool, str]:
+    username = username.strip()
+
+    if not username or not password:
+        return False, "Username and password are required."
+
+    if len(username) < 3:
+        return False, "Username must be at least 3 characters."
+
+    if len(password) < 4:
+        return False, "Password must be at least 4 characters."
+
+    conn = get_chat_conn()
+    cur = conn.cursor()
+
+    try:
+        user_id = str(uuid.uuid4())
+        now = datetime.now().isoformat(timespec="seconds")
+
+        cur.execute(
+            """
+            INSERT INTO users (id, username, password_hash, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, username, hash_password(password), now),
+        )
+        conn.commit()
+        return True, "Registration successful."
+    except sqlite3.IntegrityError:
+        return False, "Username already exists."
+    finally:
+        conn.close()
+
+
+def authenticate_user(username: str, password: str) -> Optional[sqlite3.Row]:
+    conn = get_chat_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, username
+        FROM users
+        WHERE username = ? AND password_hash = ?
+        LIMIT 1
+        """,
+        (username.strip(), hash_password(password)),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
+    conn = get_chat_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, username
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+# =========================================================
+# CONVERSATION HELPERS
+# =========================================================
+def create_conversation(user_id: str, title: str) -> str:
     conn = get_chat_conn()
     cur = conn.cursor()
 
@@ -78,10 +181,10 @@ def create_conversation(title: str) -> str:
 
     cur.execute(
         """
-        INSERT INTO conversations (id, title, status, created_at, updated_at)
-        VALUES (?, ?, 'drafting', ?, ?)
+        INSERT INTO conversations (id, user_id, title, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'drafting', ?, ?)
         """,
-        (conversation_id, title[:80], now, now),
+        (conversation_id, user_id, title[:80], now, now),
     )
 
     conn.commit()
@@ -133,32 +236,52 @@ def update_conversation_status(conversation_id: str, status: str) -> None:
     conn.close()
 
 
-def get_conversations():
+def delete_conversation(conversation_id: str, user_id: str) -> None:
+    conn = get_chat_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        "DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE id = ? AND user_id = ?)",
+        (conversation_id, user_id),
+    )
+    cur.execute(
+        "DELETE FROM conversations WHERE id = ? AND user_id = ?",
+        (conversation_id, user_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_conversations(user_id: str):
     conn = get_chat_conn()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT id, title, status, created_at, updated_at
         FROM conversations
+        WHERE user_id = ?
         ORDER BY updated_at DESC
-        """
+        """,
+        (user_id,),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_messages(conversation_id: str):
+def get_messages(conversation_id: str, user_id: str):
     conn = get_chat_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT role, content, created_at
-        FROM messages
-        WHERE conversation_id = ?
-        ORDER BY id ASC
+        SELECT m.role, m.content, m.created_at
+        FROM messages m
+        JOIN conversations c ON m.conversation_id = c.id
+        WHERE m.conversation_id = ? AND c.user_id = ?
+        ORDER BY m.id ASC
         """,
-        (conversation_id,),
+        (conversation_id, user_id),
     )
     rows = cur.fetchall()
     conn.close()
@@ -182,15 +305,22 @@ def has_message(conversation_id: str, role: str, content: str) -> bool:
     return row is not None
 
 
-def delete_conversation(conversation_id: str) -> None:
+def conversation_belongs_to_user(conversation_id: str, user_id: str) -> bool:
     conn = get_chat_conn()
     cur = conn.cursor()
-
-    cur.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-    cur.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-
-    conn.commit()
+    cur.execute(
+        """
+        SELECT 1
+        FROM conversations
+        WHERE id = ? AND user_id = ?
+        LIMIT 1
+        """,
+        (conversation_id, user_id),
+    )
+    row = cur.fetchone()
     conn.close()
+    return row is not None
+
 
 # =========================================================
 # LLM
@@ -352,16 +482,6 @@ def render_messages(messages):
 
 
 def stream_graph_until_interrupt(workflow, input_data, thread_id: str):
-    """
-    Stream LangGraph execution with stream_mode='messages'.
-
-    Returns:
-        {
-            "draft_text": str,
-            "interrupt_payload": dict | None,
-            "final_state": dict
-        }
-    """
     streamed_text = ""
     interrupt_payload = None
     final_state = {}
@@ -411,6 +531,48 @@ def stream_graph_until_interrupt(workflow, input_data, thread_id: str):
 
 
 # =========================================================
+# AUTH UI
+# =========================================================
+def render_auth_page():
+    st.title("📧 Email Drafting Agent")
+    st.caption("Login or register to continue")
+
+    tab1, tab2 = st.tabs(["Login", "Register"])
+
+    with tab1:
+        st.subheader("Login")
+        login_username = st.text_input("Username", key="login_username")
+        login_password = st.text_input("Password", type="password", key="login_password")
+
+        if st.button("Login", type="primary", use_container_width=True):
+            user = authenticate_user(login_username, login_password)
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.user_id = user["id"]
+                st.session_state.username = user["username"]
+                st.session_state.current_conversation_id = None
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+
+    with tab2:
+        st.subheader("Register")
+        reg_username = st.text_input("Choose username", key="reg_username")
+        reg_password = st.text_input("Choose password", type="password", key="reg_password")
+        reg_confirm = st.text_input("Confirm password", type="password", key="reg_confirm")
+
+        if st.button("Register", use_container_width=True):
+            if reg_password != reg_confirm:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = register_user(reg_username, reg_password)
+                if ok:
+                    st.success(msg + " Please login.")
+                else:
+                    st.error(msg)
+
+
+# =========================================================
 # PAGE CONFIG + CSS
 # =========================================================
 st.set_page_config(
@@ -431,21 +593,6 @@ st.markdown(
         border-right: 1px solid rgba(255, 255, 255, 0.08);
     }
 
-    .review-panel {
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 16px;
-        padding: 1rem;
-        background: rgba(255,255,255,0.02);
-        min-height: 620px;
-    }
-
-    .conversation-wrap {
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 16px;
-        padding: 0.5rem;
-        background: rgba(255,255,255,0.02);
-    }
-
     .stChatMessage {
         margin-bottom: 0.65rem;
     }
@@ -461,9 +608,47 @@ st.markdown(
 init_chat_db()
 workflow = build_workflow()
 
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+
+if "username" not in st.session_state:
+    st.session_state.username = None
+
 if "current_conversation_id" not in st.session_state:
     st.session_state.current_conversation_id = None
 
+
+# =========================================================
+# AUTH GATE
+# =========================================================
+if not st.session_state.logged_in or not st.session_state.user_id:
+    render_auth_page()
+    st.stop()
+
+current_user = get_user_by_id(st.session_state.user_id)
+if not current_user:
+    st.session_state.logged_in = False
+    st.session_state.user_id = None
+    st.session_state.username = None
+    st.session_state.current_conversation_id = None
+    st.rerun()
+
+user_id = current_user["id"]
+username = current_user["username"]
+
+
+# Prevent opening another user's conversation
+if st.session_state.current_conversation_id:
+    if not conversation_belongs_to_user(st.session_state.current_conversation_id, user_id):
+        st.session_state.current_conversation_id = None
+
+
+# =========================================================
+# MAIN APP
+# =========================================================
 st.title("📧 Human-in-the-Loop Email Drafting Agent")
 st.caption("Draft → Review → Revise/Approve → Send")
 
@@ -472,13 +657,23 @@ st.caption("Draft → Review → Revise/Approve → Send")
 # SIDEBAR
 # =========================================================
 with st.sidebar:
+    st.markdown(f"**Logged in as:** `{username}`")
+
+    if st.button("Logout", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.session_state.current_conversation_id = None
+        st.rerun()
+
+    st.divider()
     st.subheader("Conversations")
 
     if st.button("➕ New Conversation", use_container_width=True):
         st.session_state.current_conversation_id = None
         st.rerun()
 
-    conversations = get_conversations()
+    conversations = get_conversations(user_id)
 
     if conversations:
         for conv in conversations:
@@ -492,7 +687,7 @@ with st.sidebar:
 
             with row2:
                 if st.button("🗑️", key=f"delete_{conv['id']}", use_container_width=True):
-                    delete_conversation(conv["id"])
+                    delete_conversation(conv["id"], user_id)
 
                     if st.session_state.current_conversation_id == conv["id"]:
                         st.session_state.current_conversation_id = None
@@ -519,7 +714,7 @@ if st.session_state.current_conversation_id is None:
             st.warning("Please enter a prompt.")
         else:
             title = prompt.strip()[:60]
-            conversation_id = create_conversation(title=title)
+            conversation_id = create_conversation(user_id=user_id, title=title)
             st.session_state.current_conversation_id = conversation_id
 
             add_message(conversation_id, "user", prompt.strip())
@@ -529,7 +724,7 @@ if st.session_state.current_conversation_id is None:
 
                 with left:
                     st.subheader("Conversation")
-                    with st.container(height=620, border=False):
+                    with st.container(height=620, border=True):
                         with st.chat_message("user"):
                             st.markdown(prompt.strip())
 
@@ -568,7 +763,7 @@ if st.session_state.current_conversation_id is None:
 # =========================================================
 else:
     conversation_id = st.session_state.current_conversation_id
-    messages = get_messages(conversation_id)
+    messages = get_messages(conversation_id, user_id)
 
     left, right = st.columns([2.2, 1], gap="large")
 
@@ -643,7 +838,7 @@ else:
 
                                 with left:
                                     st.subheader("Conversation")
-                                    refreshed_messages = get_messages(conversation_id)
+                                    refreshed_messages = get_messages(conversation_id, user_id)
 
                                     with st.container(height=620, border=True):
                                         render_messages(refreshed_messages)
